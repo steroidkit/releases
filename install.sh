@@ -28,8 +28,9 @@ detect_platform() {
     case "$OS" in
         Darwin)
             case "$ARCH" in
-                arm64)  PLATFORM_BINARY="steroid-macos-arm64"  ;;
-                x86_64) PLATFORM_BINARY="steroid-macos-x86_64" ;;
+                arm64)  PLATFORM_BINARY="steroid-macos-arm64" ;;
+                # Intel Macs: no native x86_64 binary — arm64 runs via Rosetta 2
+                x86_64) PLATFORM_BINARY="steroid-macos-arm64" ;;
                 *)      die "Unsupported macOS architecture: $ARCH" ;;
             esac
             ;;
