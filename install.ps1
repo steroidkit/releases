@@ -1,5 +1,5 @@
 # Steroid installer — Windows (PowerShell 5.1+)
-# Usage: iex (irm 'https://raw.githubusercontent.com/steroidkit/releases/main/install.ps1')
+# Usage: iex (irm 'https://cli.steroidkit.com/install.ps1')
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

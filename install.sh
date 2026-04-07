@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Steroid installer — macOS and Linux
-# Usage:  curl -fsSL https://raw.githubusercontent.com/steroidkit/releases/main/install.sh | sh
+# Usage:  curl -fsSL https://cli.steroidkit.com/install.sh | sh
 set -eu
 
 GITHUB_RELEASES_REPO="steroidkit/releases"
