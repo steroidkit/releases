@@ -1,6 +1,7 @@
 # Steroid installer — Windows (PowerShell 5.1+)
 # Usage: iex (irm 'https://cli.steroidkit.com/install.ps1')
 #Requires -Version 5.1
+param([switch]$Force)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -21,12 +22,25 @@ function Write-Ok   { param($Msg) Write-Host "  [OK] $Msg" -ForegroundColor Gree
 function Write-Info { param($Msg) Write-Host "  ... $Msg" }
 function Write-Fail { param($Msg) Write-Host "  [ERR] $Msg" -ForegroundColor Red; exit 1 }
 
+function Get-InstalledVersion {
+    # Read the version stamp a previous install wrote (bare, e.g. 0.3.0), or
+    # $null if absent. A file (not `steroid --version`) so we never execute an
+    # old/broken binary and there are no side effects.
+    $stamp = Join-Path $InstallDir ".version"
+    if (Test-Path $stamp) {
+        return ((Get-Content $stamp -Raw).Trim() -replace '^v', '')
+    }
+    return $null
+}
+
 # ── Check connectivity ───────────────────────────────────────────────────────
 
 function Test-Connectivity {
     Write-Info "Checking internet connectivity..."
     try {
-        $null = Invoke-RestMethod "https://api.github.com" -TimeoutSec 5
+        # Probe github.com (web), NOT api.github.com — the GitHub API is blocked /
+        # rate-limited on many corporate VPNs, while web + release downloads are not.
+        $null = Invoke-WebRequest -Uri "https://github.com" -Method Head -TimeoutSec 5 -UseBasicParsing
         Write-Ok "Internet reachable"
     } catch {
         Write-Fail "Cannot reach github.com. Check your network connection."
@@ -37,10 +51,21 @@ function Test-Connectivity {
 
 function Get-LatestVersion {
     Write-Info "Fetching latest Steroid release..."
-    $release = Invoke-RestMethod `
-        "https://api.github.com/repos/$GITHUB_RELEASES_REPO/releases/latest" `
-        -Headers @{ Accept = "application/vnd.github.v3+json" }
-    $script:LatestVersion = $release.tag_name
+    # Resolve the version from the /releases/latest redirect
+    # (Location: .../releases/tag/<version>) — NOT the GitHub API, which is
+    # blocked / rate-limited on some corporate networks. Display only; the
+    # binary downloads via the latest/download redirect below. The try/catch
+    # covers both PowerShell 7 (returns the 3xx response) and Windows PowerShell
+    # 5.1 (throws on a 3xx when redirection is disabled).
+    $loc = $null
+    try {
+        $resp = Invoke-WebRequest -Uri "https://github.com/$GITHUB_RELEASES_REPO/releases/latest" `
+            -Method Head -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
+        $loc = $resp.Headers['Location']
+    } catch {
+        $loc = $_.Exception.Response.Headers.Location
+    }
+    if ($loc) { $script:LatestVersion = ([string]$loc -split '/tag/')[-1] }
     if (-not $script:LatestVersion) { Write-Fail "Could not determine latest version." }
     Write-Ok "Latest version: $($script:LatestVersion)"
 }
@@ -48,7 +73,9 @@ function Get-LatestVersion {
 # ── Download + verify ────────────────────────────────────────────────────────
 
 function Download-Binary {
-    $BaseUrl = "https://github.com/$GITHUB_RELEASES_REPO/releases/download/$($script:LatestVersion)"
+    # latest/download resolves the newest release server-side — no API, no
+    # version pinning needed in the URL.
+    $BaseUrl = "https://github.com/$GITHUB_RELEASES_REPO/releases/latest/download"
     $script:TmpDir = [System.IO.Path]::GetTempPath() | Join-Path -ChildPath ([System.Guid]::NewGuid())
     New-Item -ItemType Directory -Path $script:TmpDir | Out-Null
     $script:TmpBinary   = Join-Path $script:TmpDir $BinaryName
@@ -82,6 +109,8 @@ function Install-Binary {
     }
 
     Copy-Item $script:TmpBinary $Dest -Force
+    # Stamp the installed version so a later re-run can detect "already installed".
+    Set-Content (Join-Path $InstallDir ".version") $script:LatestVersion
     Remove-Item $script:TmpDir -Recurse -Force
     Write-Ok "Installed to $Dest"
 }
@@ -118,6 +147,35 @@ Test-Connectivity
 
 Write-Host ""
 Get-LatestVersion
+
+# Version guardrail (skip with -Force / $env:FORCE=1, the latter for the
+# `iex (irm ...)` one-liner):
+#   • already on the latest    -> say so and exit
+#   • an older version present -> show installed vs available and, when
+#     interactive, confirm before upgrading (default No).
+$forced = $Force -or ($env:FORCE -eq '1')
+$installed = Get-InstalledVersion
+$want = ($script:LatestVersion -replace '^v', '')
+if ((-not $forced) -and $installed) {
+    if ($installed -eq $want) {
+        Write-Host ""
+        Write-Ok "Steroid $($script:LatestVersion) is already installed — nothing to do."
+        Write-Info "Re-run with -Force (or set `$env:FORCE=1) to reinstall."
+        exit 0
+    }
+    Write-Host ""
+    Write-Info "Installed:  v$installed"
+    Write-Info "Available:  $($script:LatestVersion)"
+    if (-not [Console]::IsInputRedirected) {
+        $ans = Read-Host "  Update v$installed -> $($script:LatestVersion)? [y/N]"
+        if ($ans -notmatch '^(y|yes)$') {
+            Write-Info "Keeping v$installed — nothing changed."
+            exit 0
+        }
+    } else {
+        Write-Info "Non-interactive — upgrading to $($script:LatestVersion)."
+    }
+}
 
 Write-Host ""
 Write-Info "Downloading Steroid $($script:LatestVersion)..."
