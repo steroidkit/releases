@@ -19,6 +19,14 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Required tool not found: $1"
 }
 
+current_version() {
+    # Print the installed version bare (e.g. 0.3.0) from the stamp a previous
+    # install wrote, or nothing if absent. We read a file instead of executing
+    # `steroid --version` so we never run a possibly-old/broken binary (some
+    # builds print nothing for --version) and there are no side effects.
+    cat "$INSTALL_DIR/.version" 2>/dev/null | sed 's/^v//'
+}
+
 # ── Detect platform ───────────────────────────────────────────────────────────
 
 detect_platform() {
@@ -119,6 +127,8 @@ install_binary() {
 
     cp -f "$TMP_BINARY" "$DEST"
     chmod +x "$DEST"
+    # Stamp the installed version so a later re-run can detect "already installed".
+    printf '%s\n' "$LATEST_VERSION" > "$INSTALL_DIR/.version"
     rm -rf "$TMP_DIR"
     ok "Installed to $DEST"
 }
@@ -175,6 +185,15 @@ configure_path() {
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
+    # Force reinstall via `FORCE=1` env or a --force/-f arg (works with the
+    # `curl … | sh` pipe as `curl … | FORCE=1 sh`, or `sh -s -- --force`).
+    FORCE="${FORCE:-0}"
+    for _arg in "$@"; do
+        case "$_arg" in
+            --force|-f) FORCE=1 ;;
+        esac
+    done
+
     printf '\n  \033[1m┌─────────────────────────────────────────────────┐\033[0m\n'
     printf   '  \033[1m│              Steroid Installer                  │\033[0m\n'
     printf   '  \033[1m└─────────────────────────────────────────────────┘\033[0m\n\n'
@@ -188,6 +207,35 @@ main() {
     printf '\n'
     log "Fetching latest Steroid release..."
     fetch_latest_version
+
+    # Version guardrail (skip entirely with FORCE=1 / --force):
+    #   • already on the latest    → say so and exit
+    #   • an older version present → show installed vs available and, when a
+    #     terminal is attached, confirm before upgrading (default No). Piped
+    #     `curl | sh` means stdin is the script, so we read the answer from
+    #     /dev/tty; with no tty (CI) we upgrade automatically.
+    INSTALLED_VERSION="$(current_version)"
+    if [ "$FORCE" != "1" ] && [ -n "$INSTALLED_VERSION" ]; then
+        if [ "$INSTALLED_VERSION" = "${LATEST_VERSION#v}" ]; then
+            printf '\n'
+            ok "Steroid $LATEST_VERSION is already installed — nothing to do."
+            log "Re-run with FORCE=1 (or --force) to reinstall."
+            exit 0
+        fi
+        printf '\n'
+        log "Installed:  v$INSTALLED_VERSION"
+        log "Available:  $LATEST_VERSION"
+        if [ -r /dev/tty ]; then
+            printf '  Update v%s → %s? [y/N] ' "$INSTALLED_VERSION" "$LATEST_VERSION"
+            read _ans < /dev/tty || _ans=""
+            case "$_ans" in
+                y|Y|yes|YES) ;;
+                *) log "Keeping v$INSTALLED_VERSION — nothing changed."; exit 0 ;;
+            esac
+        else
+            log "Non-interactive — upgrading to $LATEST_VERSION."
+        fi
+    fi
 
     printf '\n'
     log "Downloading Steroid $LATEST_VERSION..."

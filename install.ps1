@@ -1,6 +1,7 @@
 # Steroid installer — Windows (PowerShell 5.1+)
 # Usage: iex (irm 'https://cli.steroidkit.com/install.ps1')
 #Requires -Version 5.1
+param([switch]$Force)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -20,6 +21,17 @@ function Write-Header {
 function Write-Ok   { param($Msg) Write-Host "  [OK] $Msg" -ForegroundColor Green }
 function Write-Info { param($Msg) Write-Host "  ... $Msg" }
 function Write-Fail { param($Msg) Write-Host "  [ERR] $Msg" -ForegroundColor Red; exit 1 }
+
+function Get-InstalledVersion {
+    # Read the version stamp a previous install wrote (bare, e.g. 0.3.0), or
+    # $null if absent. A file (not `steroid --version`) so we never execute an
+    # old/broken binary and there are no side effects.
+    $stamp = Join-Path $InstallDir ".version"
+    if (Test-Path $stamp) {
+        return ((Get-Content $stamp -Raw).Trim() -replace '^v', '')
+    }
+    return $null
+}
 
 # ── Check connectivity ───────────────────────────────────────────────────────
 
@@ -97,6 +109,8 @@ function Install-Binary {
     }
 
     Copy-Item $script:TmpBinary $Dest -Force
+    # Stamp the installed version so a later re-run can detect "already installed".
+    Set-Content (Join-Path $InstallDir ".version") $script:LatestVersion
     Remove-Item $script:TmpDir -Recurse -Force
     Write-Ok "Installed to $Dest"
 }
@@ -133,6 +147,35 @@ Test-Connectivity
 
 Write-Host ""
 Get-LatestVersion
+
+# Version guardrail (skip with -Force / $env:FORCE=1, the latter for the
+# `iex (irm ...)` one-liner):
+#   • already on the latest    -> say so and exit
+#   • an older version present -> show installed vs available and, when
+#     interactive, confirm before upgrading (default No).
+$forced = $Force -or ($env:FORCE -eq '1')
+$installed = Get-InstalledVersion
+$want = ($script:LatestVersion -replace '^v', '')
+if ((-not $forced) -and $installed) {
+    if ($installed -eq $want) {
+        Write-Host ""
+        Write-Ok "Steroid $($script:LatestVersion) is already installed — nothing to do."
+        Write-Info "Re-run with -Force (or set `$env:FORCE=1) to reinstall."
+        exit 0
+    }
+    Write-Host ""
+    Write-Info "Installed:  v$installed"
+    Write-Info "Available:  $($script:LatestVersion)"
+    if (-not [Console]::IsInputRedirected) {
+        $ans = Read-Host "  Update v$installed -> $($script:LatestVersion)? [y/N]"
+        if ($ans -notmatch '^(y|yes)$') {
+            Write-Info "Keeping v$installed — nothing changed."
+            exit 0
+        }
+    } else {
+        Write-Info "Non-interactive — upgrading to $($script:LatestVersion)."
+    }
+}
 
 Write-Host ""
 Write-Info "Downloading Steroid $($script:LatestVersion)..."
