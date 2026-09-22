@@ -50,7 +50,9 @@ detect_platform() {
 # ── Check internet ────────────────────────────────────────────────────────────
 
 check_connectivity() {
-    if curl -fsSL --connect-timeout 5 "https://api.github.com" >/dev/null 2>&1; then
+    # Probe github.com (web), NOT api.github.com — the GitHub API is blocked /
+    # rate-limited on many corporate VPNs, while web + release downloads are not.
+    if curl -fsSL --connect-timeout 5 -o /dev/null "https://github.com"; then
         ok "Internet reachable"
     else
         die "Cannot reach github.com. Check your network connection."
@@ -60,19 +62,26 @@ check_connectivity() {
 # ── Fetch latest version ──────────────────────────────────────────────────────
 
 fetch_latest_version() {
-    LATEST_VERSION="$(
-        curl -fsSL "https://api.github.com/repos/${GITHUB_RELEASES_REPO}/releases/latest" \
-        | grep '"tag_name"' \
-        | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+    # Resolve the version from the /releases/latest redirect
+    # (Location: .../releases/tag/<version>) — NOT the GitHub API, which is
+    # blocked / rate-limited on some corporate networks. Display only; the
+    # binary downloads via the latest/download redirect in download_binary().
+    _redirect="$(
+        curl -fsS -o /dev/null -w '%{redirect_url}' \
+            "https://github.com/${GITHUB_RELEASES_REPO}/releases/latest"
     )"
-    [ -n "$LATEST_VERSION" ] || die "Could not determine latest version."
+    LATEST_VERSION="${_redirect##*/tag/}"
+    { [ -n "$LATEST_VERSION" ] && [ "$LATEST_VERSION" != "$_redirect" ]; } \
+        || die "Could not determine latest version."
     ok "Latest version: $LATEST_VERSION"
 }
 
 # ── Download + verify ─────────────────────────────────────────────────────────
 
 download_binary() {
-    BASE_URL="https://github.com/${GITHUB_RELEASES_REPO}/releases/download/${LATEST_VERSION}"
+    # latest/download resolves the newest release server-side — no API, no
+    # version pinning needed in the URL.
+    BASE_URL="https://github.com/${GITHUB_RELEASES_REPO}/releases/latest/download"
     TMP_DIR="$(mktemp -d)"
     TMP_BINARY="$TMP_DIR/$PLATFORM_BINARY"
     TMP_CHECKSUM="$TMP_DIR/${PLATFORM_BINARY}.sha256"
