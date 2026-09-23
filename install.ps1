@@ -53,19 +53,31 @@ function Get-LatestVersion {
     Write-Info "Fetching latest Steroid release..."
     # Resolve the version from the /releases/latest redirect
     # (Location: .../releases/tag/<version>) — NOT the GitHub API, which is
-    # blocked / rate-limited on some corporate networks. Display only; the
-    # binary downloads via the latest/download redirect below. The try/catch
-    # covers both PowerShell 7 (returns the 3xx response) and Windows PowerShell
-    # 5.1 (throws on a 3xx when redirection is disabled).
+    # blocked / rate-limited on some corporate networks. Display only; the binary
+    # downloads via the latest/download redirect below.
+    #
+    # Use System.Net.WebRequest with redirects disabled: it behaves consistently
+    # on Windows PowerShell 5.1 AND PowerShell 7. (Invoke-WebRequest
+    # -MaximumRedirection 0 differs between the two — the exception shape /
+    # response-header access varies — which under Set-StrictMode threw
+    # "The property 'Response' cannot be found".) A 3xx with AllowAutoRedirect
+    # disabled is returned, not thrown; the catch is a safety net for 4xx/5xx.
     $loc = $null
     try {
-        $resp = Invoke-WebRequest -Uri "https://github.com/$GITHUB_RELEASES_REPO/releases/latest" `
-            -Method Head -MaximumRedirection 0 -UseBasicParsing -ErrorAction Stop
-        $loc = $resp.Headers['Location']
-    } catch {
-        $loc = $_.Exception.Response.Headers.Location
+        # Ensure TLS 1.2 — Windows PowerShell 5.1's raw HttpWebRequest can default
+        # to a protocol GitHub rejects.
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+            [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        $req = [System.Net.WebRequest]::Create("https://github.com/$GITHUB_RELEASES_REPO/releases/latest")
+        $req.Method = "HEAD"
+        $req.AllowAutoRedirect = $false
+        $resp = $req.GetResponse()
+        $loc = $resp.Headers["Location"]
+        $resp.Close()
+    } catch [System.Net.WebException] {
+        if ($_.Exception.Response) { $loc = $_.Exception.Response.Headers["Location"] }
     }
-    if ($loc) { $script:LatestVersion = ([string]$loc -split '/tag/')[-1] }
+    if ($loc) { $script:LatestVersion = (([string]$loc) -split '/tag/')[-1] }
     if (-not $script:LatestVersion) { Write-Fail "Could not determine latest version." }
     Write-Ok "Latest version: $($script:LatestVersion)"
 }
