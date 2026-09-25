@@ -150,6 +150,19 @@ function Add-ToPath {
     Write-Info "Restart your terminal for PATH changes to take effect."
 }
 
+# ── Install onboarding skill ────────────────────────────────────────────────────
+
+function Install-OnboardSkill {
+    # Drop the /steroid-onboard slash command into every detected coding agent.
+    # The command prints which agents it wired (and the next step, or a hint if
+    # none were found). Best-effort — never fail the install.
+    try {
+        & (Join-Path $InstallDir "steroid.exe") install-onboard-skill
+    } catch {
+        Write-Info "Onboarding skill step skipped ($($_.Exception.Message))"
+    }
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 Write-Header
@@ -208,7 +221,10 @@ Add-ToPath
 Write-Host ""
 Write-Host "  ┌─────────────────────────────────────────────────┐" -ForegroundColor Cyan
 Write-Host "  │  [OK] Steroid $($script:LatestVersion) installed successfully!   │" -ForegroundColor Cyan
-Write-Host "  │                                                 │" -ForegroundColor Cyan
-Write-Host "  │  Restart your terminal, then run:  steroid      │" -ForegroundColor Cyan
 Write-Host "  └─────────────────────────────────────────────────┘" -ForegroundColor Cyan
+Write-Host ""
+Write-Info "Adding the /steroid-onboard skill to your coding agents..."
+Install-OnboardSkill
+Write-Host ""
+Write-Info "(To use the steroid CLI directly, restart your terminal first.)"
 Write-Host ""

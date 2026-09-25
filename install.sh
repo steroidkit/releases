@@ -182,6 +182,16 @@ configure_path() {
     CONFIGURED=1
 }
 
+# ── Install onboarding skill ────────────────────────────────────────────────────
+
+install_onboard_skill() {
+    # Drop the /steroid-onboard slash command into every detected coding agent.
+    # We let the command's own output through (instead of a generic line) so the
+    # user sees exactly which agents got the skill — and the next step, or a hint
+    # if none were found. Best-effort — never fail the install.
+    "$INSTALL_DIR/$BINARY_NAME" install-onboard-skill || true
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 main() {
@@ -256,9 +266,10 @@ main() {
     printf '\n'
     printf '  \033[1m┌─────────────────────────────────────────────────┐\033[0m\n'
     printf   "  \033[1m│  \033[32m✓\033[0m  Steroid $LATEST_VERSION installed successfully!     \033[1m│\033[0m\n"
-    printf   '  \033[1m│                                                 │\033[0m\n'
-    printf   '  \033[1m│  Restart your terminal, then run:  steroid      │\033[0m\n'
     printf   '  \033[1m└─────────────────────────────────────────────────┘\033[0m\n\n'
+    log "Adding the /steroid-onboard skill to your coding agents..."
+    install_onboard_skill
+    printf '\n  (To use the steroid CLI directly, restart your terminal first.)\n\n'
 }
 
 main "$@"
