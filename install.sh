@@ -37,8 +37,21 @@ detect_platform() {
         Darwin)
             case "$ARCH" in
                 arm64)  PLATFORM_BINARY="steroid-macos-arm64" ;;
-                # Intel Macs: no native x86_64 binary — arm64 runs via Rosetta 2
-                x86_64) PLATFORM_BINARY="steroid-macos-arm64" ;;
+                x86_64)
+                    # Only an arm64 build exists. `uname -m` reports the shell's
+                    # architecture, so it says x86_64 both on an Intel Mac and on
+                    # an Apple Silicon Mac whose terminal runs under Rosetta.
+                    # hw.optional.arm64 reports the hardware: 1 on Apple Silicon
+                    # even under Rosetta. Anything else — 0, missing key, no
+                    # sysctl — is treated as Intel (fail closed).
+                    _arm64="$(sysctl -n hw.optional.arm64 2>/dev/null)" || _arm64=""
+                    if [ "$_arm64" = "1" ]; then
+                        PLATFORM_BINARY="steroid-macos-arm64"
+                        log "Apple Silicon Mac detected (shell running under Rosetta) — installing the arm64 build."
+                    else
+                        die "Steroid supports Apple Silicon Macs (M1 or later) only — Intel Macs aren't supported."
+                    fi
+                    ;;
                 *)      die "Unsupported macOS architecture: $ARCH" ;;
             esac
             ;;
@@ -367,4 +380,6 @@ main() {
     fi
 }
 
-main "$@"
+# STEROID_INSTALL_SOURCE_ONLY=1 lets tests source this file for its functions
+# without running the install (tests/test_detect_platform.sh).
+[ "${STEROID_INSTALL_SOURCE_ONLY:-0}" = 1 ] || main "$@"
