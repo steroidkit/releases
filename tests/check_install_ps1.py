@@ -12,13 +12,22 @@ session, where `exit` closes their window. This checks that:
   * Write-Fail throws, and the two early outs `return`;
   * -Force and $env:FORCE are both still honoured;
   * the top-level catch sets $global:LASTEXITCODE = 1 before its guarded exit;
-  * the file is pure ASCII.
+  * the file is pure ASCII;
+  * downloads name the exact release (releases/download/<tag>/, never
+    releases/latest/download), the checksum is fetched before the binary,
+    and a 404 on it falls back to the release's previous_version, read with
+    ConvertFrom-Json behind a strict-mode-safe property check, one version
+    back at most, failing with "Try again in an hour" otherwise; the version
+    actually installed is what gets recorded.
 
 ASCII matters because Windows PowerShell 5.1 reads a script without a BOM in
 the ANSI code page: UTF-8 bytes such as the 0x94 in an em dash then decode to
 U+201D, which PowerShell treats as a double quote, and the script mis-parses.
 Any byte above 0x7F fails; as a second guard, the file is also re-scanned as
 cp1252 and must tokenize the same.
+
+Each run also breaks a copy of install.ps1 on purpose, in the ways these
+checks exist for, and fails if a breakage goes unnoticed.
 
 Usage: python3 tests/check_install_ps1.py [path/to/install.ps1]
 """
@@ -203,6 +212,94 @@ def early_out_returns(lines, marker):
     return False
 
 
+def function_text(sc, name):
+    """Raw text of `function <name> { ... }`, or '' if it isn't defined once."""
+    starts = [m.start() for m in re.finditer(r"(?im)^\s*function\s+" + re.escape(name) + r"\s*\{", sc.code)]
+    if len(starts) != 1:
+        return ""
+    depth = 0
+    for i in range(sc.code.index("{", starts[0]), sc.n):
+        if sc.code[i] == "{":
+            depth += 1
+        elif sc.code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return sc.text[starts[0]:i + 1]
+    return ""
+
+
+def version_failures(sc, lines):
+    """The exact-version download and the one-version-back fallback."""
+    failures = []
+    text = sc.text
+    if "releases/latest/download" in text:
+        failures.append("downloads must name the exact release (releases/download/<tag>/), "
+                        "not releases/latest/download")
+
+    # Main body order: resolve Latest, choose the version (checksum first),
+    # then download the binary and install it.
+    order = ["Get-LatestVersion", "Select-Version", "Download-Binary", "Install-Binary"]
+    calls = [[k for k, l in enumerate(lines) if l.strip() == name] for name in order]
+    if any(len(c) != 1 for c in calls) or [c[0] for c in calls] != sorted(c[0] for c in calls):
+        failures.append(f"Install-Steroid must call {', '.join(order)} once each, in that order")
+
+    fetch = function_text(sc, "Get-ReleaseFile")
+    if '"https://github.com/$GITHUB_RELEASES_REPO/releases/download/$Tag/$Asset"' not in fetch:
+        failures.append("Get-ReleaseFile must download releases/download/$Tag/$Asset")
+    status = function_text(sc, "Get-HttpStatus")
+    if "$ex.PSObject.Properties['Response']" not in status:
+        failures.append("Get-HttpStatus must check for .Response before reading it (strict mode)")
+
+    choose = function_text(sc, "Select-Version")
+    steps = [
+        ('Get-ReleaseFile $latest "$BinaryName.sha256"', "fetch the latest release's checksum first"),
+        ("if ($status -ne 404)", "treat only a 404 as 'not ready yet'"),
+        ('Get-ReleaseFile $latest "release-notes.json"', "read that release's release-notes.json"),
+        ("Get-PreviousVersion $notes", "take previous_version from it"),
+        ('Get-ReleaseFile "v$prev" "$BinaryName.sha256"', "fetch the previous version's checksum"),
+        ('$script:InstallVersion = "v$prev"', "install the previous version"),
+    ]
+    at = 0
+    for needle, what in steps:
+        found = choose.find(needle, at)
+        if found < 0:
+            failures.append(f"Select-Version must {what}, in order ({needle!r})")
+            break
+        at = found + len(needle)
+    if choose.count("Try again in an hour.") != 2 or not all(
+            "Write-Fail" in l for l in choose.splitlines() if "Try again in an hour." in l):
+        failures.append("Select-Version must Write-Fail with 'Try again in an hour.' when there's "
+                        "no previous_version and when its file is missing too")
+    if ('$notReady = "The Windows build of $latest isn\'t ready yet"' not in choose
+            or '"$notReady, so installing v$prev. Steroid updates itself to $latest automatically once it is."'
+            not in choose):
+        failures.append("Select-Version must say which version it installs instead, and that it updates itself")
+    # One version back at most: previous_version is read once, from the
+    # latest release only.
+    if len(re.findall(r"Get-PreviousVersion\s+\$", sc.code)) != 1:
+        failures.append("Get-PreviousVersion must be called exactly once (never more than one version back)")
+
+    prev = function_text(sc, "Get-PreviousVersion")
+    for needle, what in [
+        ("ConvertFrom-Json", "parse the manifest with ConvertFrom-Json"),
+        ("$manifest.PSObject.Properties['previous_version']", "check previous_version exists (strict mode)"),
+        ("'^[0-9]+\\.[0-9]+\\.[0-9]+$'", "accept only a plain X.Y.Z"),
+    ]:
+        if needle not in prev:
+            failures.append(f"Get-PreviousVersion must {what}")
+
+    download = function_text(sc, "Download-Binary")
+    if "/releases/download/$($script:InstallVersion)/$BinaryName" not in download:
+        failures.append("Download-Binary must download the binary of $script:InstallVersion")
+    install = function_text(sc, "Install-Binary")
+    records = ["$VersionBare = $script:InstallVersion -replace '^v', ''",
+               '(Join-Path $InstallDir ".version") -Value $script:InstallVersion']
+    if "LatestVersion" in download + install or not all(r in install for r in records):
+        failures.append("Download-Binary and Install-Binary must use $script:InstallVersion (the version "
+                        "actually installed) for versions\\<ver> and bin\\.version, never LatestVersion")
+    return failures
+
+
 def check(raw):
     """Return the list of failures for install.ps1's raw bytes."""
     failures = []
@@ -241,6 +338,7 @@ def check(raw):
     for needed in ("Set-StrictMode -Version Latest", "$ErrorActionPreference = 'Stop'"):
         if needed not in text:
             failures.append(f"missing: {needed}")
+    failures += version_failures(sc, lines)
 
     # Pure ASCII, so no code page can change how the script parses. This also
     # rejects a BOM (EF BB BF).
@@ -275,16 +373,68 @@ def self_test():
     assert any("`exit` must appear only" in f for f in fails), fails
 
 
+# Ways install.ps1 could be broken that the checks above must catch:
+# (what, text to replace, replacement). Each runs against a copy of the real file.
+BREAKAGES = [
+    ("downloads via releases/latest/download",
+     "releases/download/$Tag/$Asset", "releases/latest/download/$Asset"),
+    ("the binary from the latest release, not the version chosen",
+     "releases/download/$($script:InstallVersion)/$BinaryName", "releases/download/$($script:LatestVersion)/$BinaryName"),
+    ("the version isn't chosen before the download",
+     "    Get-LatestVersion\n    Select-Version\n", "    Get-LatestVersion\n"),
+    ("the binary downloaded before the version is chosen",
+     "    Select-Version\n", "    Download-Binary\n    Select-Version\n"),
+    ("any failure counts as 'not ready yet'",
+     "if ($status -ne 404)", "if ($false)"),
+    ("previous_version read without the strict-mode check",
+     "if ($manifest -and $manifest.PSObject.Properties['previous_version'])", "if ($manifest.previous_version)"),
+    ("previous_version accepted unvalidated",
+     "'^[0-9]+\\.[0-9]+\\.[0-9]+$'", "'.'"),
+    ("falls back two versions",
+     '$script:InstallVersion = "v$prev"',
+     '$prev = Get-PreviousVersion $notes; $script:InstallVersion = "v$prev"'),
+    ("the fallback failure exits",
+     'Write-Fail "$notReady, and v$prev', 'exit 1; Write-Fail "$notReady, and v$prev'),
+    ("a fallback failure without 'Try again in an hour.'",
+     "and there's no earlier version to install instead. Try again in an hour.",
+     "and there's no earlier version to install instead."),
+    ("bin\\.version records the latest, not the version installed",
+     "-Value $script:InstallVersion -Encoding ASCII", "-Value $script:LatestVersion -Encoding ASCII"),
+    ("versions\\<ver> named after the latest",
+     "$VersionBare = $script:InstallVersion -replace", "$VersionBare = $script:LatestVersion -replace"),
+    ("the plan's wording pasted with a typographic apostrophe",
+     "build of $latest isn't ready yet", "build of $latest isn’t ready yet"),
+    ("Get-HttpStatus reads .Response unguarded",
+     "if ($ex.PSObject.Properties['Response'] -and $ex.Response)", "if ($ex.Response)"),
+]
+
+
+def breakage_test(raw):
+    """Each BREAKAGES entry must make check() fail. Returns what went unnoticed."""
+    text = raw.decode("utf-8")
+    missed = []
+    for what, old, new in BREAKAGES:
+        if text.count(old) != 1:
+            missed.append(f"{what}: the text to break isn't in install.ps1 exactly once ({old!r})")
+        elif not check(text.replace(old, new).encode("utf-8")):
+            missed.append(f"{what}: not caught")
+    return missed
+
+
 def main():
     self_test()
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent.parent / "install.ps1"
-    failures = check(path.read_bytes())
+    raw = path.read_bytes()
+    failures = check(raw)
+    if not failures:
+        failures = [f"breakage check: {m}" for m in breakage_test(raw)]
     for f in failures:
         print(f"FAIL  {f}")
     if failures:
         print(f"{path.name}: {len(failures)} failure(s)")
         return 1
-    print(f"{path.name}: ok (pure ASCII, no stray exit, balanced, guarded exit + LASTEXITCODE, throw/return, -Force/$env:FORCE)")
+    print(f"{path.name}: ok (pure ASCII, no stray exit, balanced, guarded exit + LASTEXITCODE, throw/return, "
+          f"-Force/$env:FORCE, exact-version downloads + one-version fallback; {len(BREAKAGES)} breakages caught)")
     return 0
 
 

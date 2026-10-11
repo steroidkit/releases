@@ -1,5 +1,6 @@
 #!/bin/sh
-# Tests install.sh's detect_platform with `uname` and `sysctl` stubbed on PATH.
+# Tests install.sh's detect_platform with `uname` and `sysctl` stubbed on PATH,
+# then runs tests/test_download.sh (downloads and the fallback, curl stubbed).
 # Sources install.sh with STEROID_INSTALL_SOURCE_ONLY=1, so nothing is
 # downloaded or installed and the real HOME is never touched.
 #
@@ -169,6 +170,17 @@ if "$TEST_SH_PATH" -n "$INSTALL_SH" 2> "$WORK/err"; then
     pass "$TEST_SH -n install.sh"
 else
     STATUS=$?; fail "$TEST_SH -n install.sh" "syntax error"
+fi
+
+# The download and fallback cases (stubbed curl) have their own file. Run it
+# from here too, so the one command the release checklist names covers both.
+echo
+if TEST_SH="$TEST_SH" sh "$HERE/test_download.sh"; then
+    echo
+    pass "tests/test_download.sh"
+else
+    STATUS=$?; : > "$WORK/out"; : > "$WORK/err"; echo
+    fail "tests/test_download.sh" "see its failures above"
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

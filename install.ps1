@@ -74,8 +74,9 @@ function Install-Steroid {
         Write-Info "Fetching latest Steroid release..."
         # Resolve the version from the /releases/latest redirect
         # (Location: .../releases/tag/<version>) -- NOT the GitHub API, which is
-        # blocked / rate-limited on some corporate networks. Display only; the binary
-        # downloads via the latest/download redirect below.
+        # blocked / rate-limited on some corporate networks. Every download below
+        # names this exact tag, so a release going public mid-install can't mix
+        # one release's binary with another's checksum.
         #
         # Use System.Net.WebRequest with redirects disabled: it behaves consistently
         # on Windows PowerShell 5.1 AND PowerShell 7. (Invoke-WebRequest
@@ -108,31 +109,101 @@ function Install-Steroid {
         Write-Ok "Latest version: $($script:LatestVersion)"
     }
 
+    # -- Choose the version to install ---------------------------------------------
+
+    function Get-HttpStatus {
+        # The HTTP status of a failed Invoke-WebRequest, or 0 when no response
+        # came back (no network). Windows PowerShell 5.1 throws a WebException
+        # and PowerShell 7 an HttpResponseException; both carry
+        # .Response.StatusCode. Other exceptions have no .Response at all, and
+        # strict mode throws on a missing property, hence the PSObject check.
+        param($ErrorRecord)
+        $ex = $ErrorRecord.Exception
+        if ($ex.PSObject.Properties['Response'] -and $ex.Response) {
+            try { return [int]$ex.Response.StatusCode } catch { }
+        }
+        return 0
+    }
+
+    function Get-ReleaseFile {
+        # Download one asset of one exact release to $OutFile. Returns the HTTP
+        # status: 200, 404 when the release lacks the file, 0 for no response.
+        param([string]$Tag, [string]$Asset, [string]$OutFile)
+        try {
+            Invoke-WebRequest "https://github.com/$GITHUB_RELEASES_REPO/releases/download/$Tag/$Asset" -OutFile $OutFile -UseBasicParsing
+            return 200
+        } catch {
+            return (Get-HttpStatus $_)
+        }
+    }
+
+    function Get-PreviousVersion {
+        # previous_version from a release-notes.json, bare (e.g. 0.4.0), or ''.
+        # Only a plain X.Y.Z, so nothing else ends up in a URL or a path.
+        param([string]$Path)
+        try {
+            $manifest = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+            # Strict mode throws on a property the object doesn't have.
+            if ($manifest -and $manifest.PSObject.Properties['previous_version']) {
+                $prev = ([string]$manifest.previous_version) -replace '^v', ''
+                if ($prev -match '^[0-9]+\.[0-9]+\.[0-9]+$') { return $prev }
+            }
+        } catch { }
+        return ''
+    }
+
+    function Select-Version {
+        # Sets $script:InstallVersion and fetches its checksum.
+        #
+        # The checksum comes first. A release goes public once its macOS and
+        # Windows files are up, so Windows is normally there; if it isn't (a
+        # halted or broken release), this installs the version the release names
+        # as previous_version, which updates itself later. Never more than one
+        # version back.
+        #
+        # The checksum is mandatory, not best-effort: every build computes one
+        # alongside its binary, so a binary is never installed unverified.
+        #
+        # Reset first: under `iex` the script scope is the user's session.
+        $script:InstallVersion = $null
+        $script:TmpDir = [System.IO.Path]::GetTempPath() | Join-Path -ChildPath ([System.Guid]::NewGuid())
+        New-Item -ItemType Directory -Path $script:TmpDir | Out-Null
+        $script:TmpChecksum = Join-Path $script:TmpDir "$BinaryName.sha256"
+        $latest = $script:LatestVersion
+
+        $status = Get-ReleaseFile $latest "$BinaryName.sha256" $script:TmpChecksum
+        if ($status -eq 200) { $script:InstallVersion = $latest; return }
+        if ($status -ne 404) {
+            Write-Fail "Could not download the checksum for $latest. Check your network connection and try again."
+        }
+
+        $notReady = "The Windows build of $latest isn't ready yet"
+        $prev = ''
+        $notes = Join-Path $script:TmpDir "release-notes.json"
+        if ((Get-ReleaseFile $latest "release-notes.json" $notes) -eq 200) { $prev = Get-PreviousVersion $notes }
+        if ((-not $prev) -or ($prev -eq ($latest -replace '^v', ''))) {
+            Write-Fail "$notReady, and there's no earlier version to install instead. Try again in an hour."
+        }
+        $status = Get-ReleaseFile "v$prev" "$BinaryName.sha256" $script:TmpChecksum
+        if ($status -eq 404) {
+            Write-Fail "$notReady, and v$prev's isn't available either. Try again in an hour."
+        }
+        if ($status -ne 200) {
+            Write-Fail "Could not download the checksum for v$prev. Check your network connection and try again."
+        }
+        $script:InstallVersion = "v$prev"
+        Write-Info "$notReady, so installing v$prev. Steroid updates itself to $latest automatically once it is."
+    }
+
     # -- Download + verify --------------------------------------------------------
 
     function Download-Binary {
-        # latest/download resolves the newest release server-side -- no API, no
-        # version pinning needed in the URL.
-        $BaseUrl = "https://github.com/$GITHUB_RELEASES_REPO/releases/latest/download"
-        $script:TmpDir = [System.IO.Path]::GetTempPath() | Join-Path -ChildPath ([System.Guid]::NewGuid())
-        New-Item -ItemType Directory -Path $script:TmpDir | Out-Null
-        $script:TmpBinary   = Join-Path $script:TmpDir $BinaryName
-        $script:TmpChecksum = Join-Path $script:TmpDir "$BinaryName.sha256"
+        $script:TmpBinary = Join-Path $script:TmpDir $BinaryName
 
         Write-Info "Downloading $BinaryName..."
-        Invoke-WebRequest "$BaseUrl/$BinaryName" -OutFile $script:TmpBinary -UseBasicParsing
+        Invoke-WebRequest "https://github.com/$GITHUB_RELEASES_REPO/releases/download/$($script:InstallVersion)/$BinaryName" -OutFile $script:TmpBinary -UseBasicParsing
 
         Write-Info "Verifying checksum..."
-        # Mandatory, not best-effort: every build (CI for Linux, scripts/build-local.sh
-        # / .ps1 for macOS/Windows) computes a .sha256 alongside its binary, so a
-        # missing one means the release upload step was incomplete, not that no
-        # checksum was ever produced -- worth aborting over, not silently installing
-        # an unverified binary.
-        try {
-            Invoke-WebRequest "$BaseUrl/$BinaryName.sha256" -OutFile $script:TmpChecksum -UseBasicParsing
-        } catch {
-            Write-Fail "No checksum published for this release -- refusing to install an unverified binary."
-        }
         $Expected = (Get-Content $script:TmpChecksum -Raw).Trim().Split()[0].ToLower()
         $Actual   = (Get-FileHash $script:TmpBinary -Algorithm SHA256).Hash.ToLower()
         if ($Actual -ne $Expected) {
@@ -211,7 +282,9 @@ function Install-Steroid {
         # discarding it.
         $IsFirstVersionedInstall = (Test-Path -LiteralPath $Dest) -and -not (Test-Path -LiteralPath $VersionsDir)
 
-        $VersionBare = $script:LatestVersion -replace '^v', ''
+        # The version actually installed: the previous one when the Windows build
+        # of the latest isn't up (Select-Version).
+        $VersionBare = $script:InstallVersion -replace '^v', ''
         $VersionDir = Join-Path $VersionsDir $VersionBare
         New-Item -ItemType Directory -Force -Path $VersionDir | Out-Null
         $VersionDest = Join-Path $VersionDir "steroid.exe"
@@ -254,7 +327,7 @@ function Install-Steroid {
 
         # Only now that the new binary is actually in place: a later re-run's
         # "already installed" check trusts this stamp.
-        Set-Content -LiteralPath (Join-Path $InstallDir ".version") -Value $script:LatestVersion -Encoding ASCII
+        Set-Content -LiteralPath (Join-Path $InstallDir ".version") -Value $script:InstallVersion -Encoding ASCII
         Remove-Item -LiteralPath $script:TmpDir -Recurse -Force -ErrorAction SilentlyContinue
         Prune-OldVersions -JustInstalled $VersionBare
         Write-Ok "Installed to $Dest"
@@ -323,39 +396,40 @@ function Install-Steroid {
 
     Write-Host ""
     Get-LatestVersion
+    Select-Version
 
     # Version guardrail (skip with -Force / $env:FORCE=1, the latter for the
     # `iex (irm ...)` one-liner):
-    #   - already on the latest    -> say so and stop
+    #   - already on the version to install -> say so and stop
     #   - an older version present -> show installed vs available and, when
     #     interactive, confirm before upgrading (default No).
     # $Force is the script's param, read from the enclosing scope.
     $forced = $Force -or ($env:FORCE -eq '1')
     $installed = Get-InstalledVersion
-    $want = ($script:LatestVersion -replace '^v', '')
+    $want = ($script:InstallVersion -replace '^v', '')
     if ((-not $forced) -and $installed) {
         if ($installed -eq $want) {
             Write-Host ""
-            Write-Ok "Steroid $($script:LatestVersion) is already installed -- nothing to do."
+            Write-Ok "Steroid $($script:InstallVersion) is already installed -- nothing to do."
             Write-Info "Re-run with -Force (or set `$env:FORCE=1) to reinstall."
             return
         }
         Write-Host ""
         Write-Info "Installed:  v$installed"
-        Write-Info "Available:  $($script:LatestVersion)"
+        Write-Info "Available:  $($script:InstallVersion)"
         if (-not [Console]::IsInputRedirected) {
-            $ans = Read-Host "  Update v$installed -> $($script:LatestVersion)? [y/N]"
+            $ans = Read-Host "  Update v$installed -> $($script:InstallVersion)? [y/N]"
             if ($ans -notmatch '^(y|yes)$') {
                 Write-Info "Keeping v$installed -- nothing changed."
                 return
             }
         } else {
-            Write-Info "Non-interactive -- upgrading to $($script:LatestVersion)."
+            Write-Info "Non-interactive -- upgrading to $($script:InstallVersion)."
         }
     }
 
     Write-Host ""
-    Write-Info "Downloading Steroid $($script:LatestVersion)..."
+    Write-Info "Downloading Steroid $($script:InstallVersion)..."
     Download-Binary
 
     Write-Host ""
@@ -372,7 +446,7 @@ function Install-Steroid {
 
     Write-Host ""
     Write-Host "  +-------------------------------------------------+" -ForegroundColor Cyan
-    Write-Host "  |  [OK] Steroid $($script:LatestVersion) installed successfully!    |" -ForegroundColor Cyan
+    Write-Host "  |  [OK] Steroid $($script:InstallVersion) installed successfully!    |" -ForegroundColor Cyan
     Write-Host "  +-------------------------------------------------+" -ForegroundColor Cyan
     Write-Host ""
     Write-Info "Adding the /steroid-onboard skill to your coding agents..."

@@ -85,8 +85,9 @@ check_connectivity() {
 fetch_latest_version() {
     # Resolve the version from the /releases/latest redirect
     # (Location: .../releases/tag/<version>) — NOT the GitHub API, which is
-    # blocked / rate-limited on some corporate networks. Display only; the
-    # binary downloads via the latest/download redirect in download_binary().
+    # blocked / rate-limited on some corporate networks. Every download below
+    # names this exact tag, so a release going public mid-install can't mix
+    # one release's binary with another's checksum.
     _redirect="$(
         curl -fsS -o /dev/null -w '%{redirect_url}' \
             "https://github.com/${GITHUB_RELEASES_REPO}/releases/latest"
@@ -97,30 +98,89 @@ fetch_latest_version() {
     ok "Latest version: $LATEST_VERSION"
 }
 
+# ── Choose the version to install ───────────────────────────────────────────
+
+release_url() {
+    # release_url <tag> <asset>: one asset of one exact release.
+    printf 'https://github.com/%s/releases/download/%s/%s' "$GITHUB_RELEASES_REPO" "$1" "$2"
+}
+
+http_get() {
+    # http_get <url> <file>: download to <file> and print the final HTTP
+    # status, or "failed" when curl itself failed (no network, a transfer cut
+    # short). No -f, so a 404 is a status to act on rather than an error.
+    _status="$(curl -sSL -o "$2" -w '%{http_code}' "$1")" || _status=failed
+    printf '%s' "$_status"
+}
+
+previous_version_of() {
+    # previous_version_of <release-notes.json>: its "previous_version", bare
+    # (e.g. 0.4.0), or nothing. No jq on a fresh machine, and sed is enough:
+    # publish_release.py writes the manifest with indent=2, so the key and its
+    # value always share a line. A quote inside a JSON string is escaped, so
+    # text quoted in a note can't pass for the key. Only a plain X.Y.Z
+    # matches, so nothing else ends up in a URL or a path.
+    sed -n 's/.*"previous_version"[[:space:]]*:[[:space:]]*"v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' "$1" \
+        | head -n 1
+}
+
+platform_label() {
+    case "$PLATFORM_BINARY" in
+        steroid-macos-*) printf 'macOS' ;;
+        *)               printf 'Linux' ;;
+    esac
+}
+
+choose_version() {
+    # Sets INSTALL_VERSION and fetches its checksum into TMP_CHECKSUM.
+    #
+    # The checksum comes first. A release goes public once its macOS and
+    # Windows files are up; Linux follows from CI, usually within the hour.
+    # Until then the Linux checksum is a 404, and this installs the version
+    # the release names as previous_version (it updates itself once Linux
+    # lands). Never more than one version back: publish_release.py only
+    # publishes early when that previous release has its own Linux files.
+    #
+    # The checksum is mandatory, not best-effort: every build computes one
+    # alongside its binary, so a binary is never installed unverified.
+    TMP_DIR="$(mktemp -d)"
+    TMP_CHECKSUM="$TMP_DIR/${PLATFORM_BINARY}.sha256"
+    INSTALL_VERSION="$LATEST_VERSION"
+    case "$(http_get "$(release_url "$LATEST_VERSION" "${PLATFORM_BINARY}.sha256")" "$TMP_CHECKSUM")" in
+        200) return 0 ;;
+        404) ;;
+        *)   die "Could not download the checksum for $LATEST_VERSION. Check your network connection and try again." ;;
+    esac
+
+    _label="$(platform_label)"
+    _not_ready="The $_label build of $LATEST_VERSION isn't ready yet"
+    _prev=""
+    if [ "$(http_get "$(release_url "$LATEST_VERSION" release-notes.json)" "$TMP_DIR/release-notes.json")" = 200 ]; then
+        _prev="$(previous_version_of "$TMP_DIR/release-notes.json")"
+    fi
+    { [ -n "$_prev" ] && [ "$_prev" != "${LATEST_VERSION#v}" ]; } \
+        || die "$_not_ready, and there's no earlier version to install instead. Try again in an hour."
+    case "$(http_get "$(release_url "v$_prev" "${PLATFORM_BINARY}.sha256")" "$TMP_CHECKSUM")" in
+        200) ;;
+        404) die "$_not_ready, and v$_prev's isn't available either. Try again in an hour." ;;
+        *)   die "Could not download the checksum for v$_prev. Check your network connection and try again." ;;
+    esac
+    INSTALL_VERSION="v$_prev"
+    log "$_not_ready, so installing $INSTALL_VERSION. Steroid updates itself to $LATEST_VERSION automatically once it is."
+}
+
 # ── Download + verify ─────────────────────────────────────────────────────────
 
 download_binary() {
-    # latest/download resolves the newest release server-side — no API, no
-    # version pinning needed in the URL.
-    BASE_URL="https://github.com/${GITHUB_RELEASES_REPO}/releases/latest/download"
-    TMP_DIR="$(mktemp -d)"
     TMP_BINARY="$TMP_DIR/$PLATFORM_BINARY"
-    TMP_CHECKSUM="$TMP_DIR/${PLATFORM_BINARY}.sha256"
 
     log "Downloading $PLATFORM_BINARY..."
     curl -fSL --progress-bar \
-        "$BASE_URL/$PLATFORM_BINARY" \
+        "$(release_url "$INSTALL_VERSION" "$PLATFORM_BINARY")" \
         -o "$TMP_BINARY" \
         || die "Download failed."
 
     log "Verifying checksum..."
-    # Mandatory, not best-effort: every build (CI for Linux, scripts/build-local.sh
-    # / .ps1 for macOS/Windows) computes a .sha256 alongside its binary, so a
-    # missing one means the release upload step was incomplete, not that no
-    # checksum was ever produced — worth aborting over, not silently installing
-    # an unverified binary.
-    curl -fsSL "$BASE_URL/${PLATFORM_BINARY}.sha256" -o "$TMP_CHECKSUM" \
-        || die "No checksum published for this release — refusing to install an unverified binary."
     EXPECTED="$(awk '{print $1}' "$TMP_CHECKSUM")"
     if command -v sha256sum >/dev/null 2>&1; then
         ACTUAL="$(sha256sum "$TMP_BINARY" | awk '{print $1}')"
@@ -151,7 +211,9 @@ KEEP_VERSIONS=2
 install_binary() {
     DEST="$INSTALL_DIR/$BINARY_NAME"
     VERSIONS_DIR="$HOME/.steroid/versions"
-    VERSION_BARE="${LATEST_VERSION#v}"
+    # The version actually installed: the previous one when this platform's
+    # build of the latest isn't up yet (choose_version).
+    VERSION_BARE="${INSTALL_VERSION#v}"
     VERSION_DEST="$VERSIONS_DIR/$VERSION_BARE/$BINARY_NAME"
 
     mkdir -p "$INSTALL_DIR" "$(dirname "$VERSION_DEST")"
@@ -183,7 +245,7 @@ install_binary() {
     mv -f "$INSTALL_DIR/.steroid.new" "$DEST"
 
     # Stamp the installed version so a later re-run can detect "already installed".
-    printf '%s\n' "$LATEST_VERSION" > "$INSTALL_DIR/.version"
+    printf '%s\n' "$INSTALL_VERSION" > "$INSTALL_DIR/.version"
     rm -rf "$TMP_DIR"
     prune_old_versions "$VERSION_BARE"
     ok "Installed to $DEST"
@@ -314,38 +376,39 @@ main() {
     printf '\n'
     log "Fetching latest Steroid release..."
     fetch_latest_version
+    choose_version
 
     # Version guardrail (skip entirely with FORCE=1 / --force):
-    #   • already on the latest    → say so and exit
+    #   • already on the version to install → say so and exit
     #   • an older version present → show installed vs available and, when a
     #     terminal is attached, confirm before upgrading (default No). Piped
     #     `curl | sh` means stdin is the script, so we read the answer from
     #     /dev/tty; with no tty (CI) we upgrade automatically.
     INSTALLED_VERSION="$(current_version)"
     if [ "$FORCE" != "1" ] && [ -n "$INSTALLED_VERSION" ]; then
-        if [ "$INSTALLED_VERSION" = "${LATEST_VERSION#v}" ]; then
+        if [ "$INSTALLED_VERSION" = "${INSTALL_VERSION#v}" ]; then
             printf '\n'
-            ok "Steroid $LATEST_VERSION is already installed — nothing to do."
+            ok "Steroid $INSTALL_VERSION is already installed — nothing to do."
             log "Re-run with FORCE=1 (or --force) to reinstall."
             exit 0
         fi
         printf '\n'
         log "Installed:  v$INSTALLED_VERSION"
-        log "Available:  $LATEST_VERSION"
+        log "Available:  $INSTALL_VERSION"
         if [ -r /dev/tty ]; then
-            printf '  Update v%s → %s? [y/N] ' "$INSTALLED_VERSION" "$LATEST_VERSION"
+            printf '  Update v%s → %s? [y/N] ' "$INSTALLED_VERSION" "$INSTALL_VERSION"
             read _ans < /dev/tty || _ans=""
             case "$_ans" in
                 y|Y|yes|YES) ;;
                 *) log "Keeping v$INSTALLED_VERSION — nothing changed."; exit 0 ;;
             esac
         else
-            log "Non-interactive — upgrading to $LATEST_VERSION."
+            log "Non-interactive — upgrading to $INSTALL_VERSION."
         fi
     fi
 
     printf '\n'
-    log "Downloading Steroid $LATEST_VERSION..."
+    log "Downloading Steroid $INSTALL_VERSION..."
     download_binary
 
     printf '\n'
@@ -362,7 +425,7 @@ main() {
 
     printf '\n'
     printf '  \033[1m┌─────────────────────────────────────────────────┐\033[0m\n'
-    printf   "  \033[1m│  \033[32m✓\033[0m  Steroid $LATEST_VERSION installed successfully!     \033[1m│\033[0m\n"
+    printf   "  \033[1m│  \033[32m✓\033[0m  Steroid $INSTALL_VERSION installed successfully!     \033[1m│\033[0m\n"
     printf   '  \033[1m└─────────────────────────────────────────────────┘\033[0m\n\n'
     log "Adding the /steroid-onboard skill to your coding agents..."
     install_onboard_skill
